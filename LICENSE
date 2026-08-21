@@ -1,0 +1,44 @@
+Copyright (c) 2026 Malach IS s.r.o.
+
+All rights reserved.
+
+PERMITTED USE
+
+You may download this script and run it to provision and configure the
+MIS-DataCenter site for Handoff 365 within a Microsoft 365 tenant that you own
+or administer. You may retain a copy for your own records and for repeated use
+in that tenant.
+
+NOT PERMITTED
+
+Without prior written permission from Malach IS s.r.o., you may not:
+
+- redistribute this script, in original or modified form;
+- modify this script and represent the result as originating from
+  Malach IS s.r.o.;
+- incorporate this script, or a substantial part of it, into another product
+  or service;
+- use this script other than to deploy or maintain Handoff 365.
+
+RELATIONSHIP TO THE AGREEMENT
+
+This licence governs the script only. Use of Handoff 365 itself is governed by
+the Malach IS contractual framework published at
+https://www.malachis.eu/en-US/terms — the Master Terms of Service, the General
+Product Terms and the Product Terms for Handoff 365. Nothing in this licence
+extends, limits or replaces those documents.
+
+NO WARRANTY
+
+This script is provided "as is", without warranty of any kind, express or
+implied, including but not limited to the warranties of merchantability,
+fitness for a particular purpose and non-infringement. Malach IS s.r.o. shall
+not be liable for any claim, damages or other liability arising from the use of
+this script.
+
+The service levels applicable to Handoff 365, where the purchased plan includes
+them, are set out in the SLA and are unaffected by this disclaimer.
+
+Malach IS s.r.o.
+support@malachis.eu
+https://www.malachis.eu
