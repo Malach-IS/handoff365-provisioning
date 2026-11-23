@@ -4,6 +4,15 @@ Releases are tagged with the MIS-DataCenter schema version the script
 provisions. The Handoff 365 setup guide references a specific release, so that
 the instructions match the script they describe.
 
+## v1.4.9
+
+- `MIS_HandoffActivity.ActivityType` gains the choice `Exchange`, used by the
+  Handoff 365 "Exchange" link (receive and share files in one link, Enterprise).
+  On an existing site the script adds the choice to the current ones.
+
+Upgrading: run the new script against your existing DataCenter site. It is
+idempotent and adds only what is missing; no data is changed.
+
 ## v1.4.8
 
 Includes the changes of schema 1.4.7, which was not released separately.

@@ -822,7 +822,9 @@ function Ensure-MISMasterData {
 #        server at creation) and SharePartnerCanClose on MIS_HandoffEnabledLibraries (library
 #        default). Empty = not set -> the server resolves the tenant setting live (today's
 #        behaviour), so a tenant that is never backfilled behaves exactly as before.
-$HandoffSchemaVersion = "1.4.8"
+# 1.4.9: MIS_HandoffActivity.ActivityType gains the choice 'Exchange' (Handoff "Exchange" link:
+#        receive + share in one link, Enterprise). Existing lists get the choice added below.
+$HandoffSchemaVersion = "1.4.9"
 
 # ---- Connect + shared core -------------------------------------------------
 
@@ -870,7 +872,7 @@ New-MISList -InternalName "MIS_HandoffAuditLog" -ColumnsBlock {
 Write-Host "`n--- MIS_HandoffActivity ---" -ForegroundColor Yellow
 New-MISList -InternalName "MIS_HandoffActivity" -ColumnsBlock {
     param([string]$list)
-    Add-FieldIfMissing -ListName $list -FieldName "ActivityType"  -FieldType "Choice"   -ExtraParams @{ Choices = @("Request","Share") }
+    Add-FieldIfMissing -ListName $list -FieldName "ActivityType"  -FieldType "Choice"   -ExtraParams @{ Choices = @("Request","Share","Exchange") }
     Add-FieldIfMissing -ListName $list -FieldName "TargetSiteId"  -FieldType "Text"
     Add-FieldIfMissing -ListName $list -FieldName "TargetDriveId" -FieldType "Text"
     Add-FieldIfMissing -ListName $list -FieldName "TargetItemId"  -FieldType "Text"     -ExtraParams @{ Indexed = $true }
@@ -891,6 +893,29 @@ New-MISList -InternalName "MIS_HandoffActivity" -ColumnsBlock {
     # DefaultValue "" is explicit: Add-PnPField gives a Choice column the first choice ("Yes") as
     # default, which SharePoint would stamp on every new row. Re-runs clear it on existing fields.
     Add-FieldIfMissing -ListName $list -FieldName "PartnerCanClose" -FieldType "Choice" -ExtraParams @{ Choices = @("Yes","No"); DefaultValue = "" }
+}
+
+# Existing tenants (schema 1.4.9): Add-FieldIfMissing does NOT update an existing Choice field's
+# choices, so ensure 'Exchange' is present on ActivityType (idempotent; honours -WhatIf; the
+# list-existence guard keeps -WhatIf on a fresh site clean).
+if (Test-ListExists -ListName "MIS_HandoffActivity") {
+    try {
+        $typeField = Get-PnPField -List "MIS_HandoffActivity" -Identity "ActivityType" -ErrorAction Stop
+        if ($typeField.Choices -notcontains "Exchange" -and
+            $PSCmdlet.ShouldProcess("MIS_HandoffActivity/ActivityType", "Add choice 'Exchange'")) {
+            $choices = [string[]]@(@($typeField.Choices) + "Exchange" | Select-Object -Unique)
+            Set-PnPField -List "MIS_HandoffActivity" -Identity "ActivityType" -Values @{ Choices = $choices } | Out-Null
+            $check = Get-PnPField -List "MIS_HandoffActivity" -Identity "ActivityType" -ErrorAction Stop
+            if ($check.Choices -contains "Exchange") {
+                Write-Host "ActivityType choices updated to include 'Exchange'." -ForegroundColor Green
+            } else {
+                Write-Warning "ActivityType choices still lack 'Exchange' -- add it by hand in the list settings."
+            }
+        }
+    }
+    catch {
+        Write-Warning "Could not verify/update ActivityType choices: $($_.Exception.Message)"
+    }
 }
 
 # ---- MIS_HandoffEnabledLibraries -------------------------------------------
