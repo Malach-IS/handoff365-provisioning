@@ -47,8 +47,11 @@ missing.
 
 ## What the script does
 
-Creates the shared MIS core lists and three Handoff 365 lists, sets list
-permissions and versioning, and seeds the configuration list with defaults.
+Creates the MIS core lists (`MIS_Config`, `MIS_SchemaVersion`) and three
+Handoff 365 lists, grants the Handoff 365 service access to those lists, sets
+list permissions and versioning, and seeds the configuration list with
+defaults. If the account running the script cannot grant that access, the
+script warns and continues; Malach IS support can complete it remotely.
 
 It does **not**:
 

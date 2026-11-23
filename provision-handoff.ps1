@@ -8,9 +8,9 @@
     Provisions Handoff 365 on an MIS-DataCenter site (self-sufficient).
 
 .DESCRIPTION
-    Idempotent. Ensures the shared core (Hub, MIS_Config, MIS_SchemaVersion, master-data
-    lists -- via Ensure-MISCoreLists), then creates the Handoff lists and seeds Handoff365
-    config:
+    Idempotent. Ensures the shared core (MIS_Config, MIS_SchemaVersion -- via
+    Ensure-MISCoreLists; no Hub registration, no master data), then creates the Handoff
+    lists and seeds Handoff365 config:
       - MIS_HandoffAuditLog          (append-only event log)
       - MIS_HandoffActivity          (active requests/shares + revoke state)
       - MIS_HandoffEnabledLibraries  (registry of Handoff-enabled libraries)
@@ -225,7 +225,9 @@ function Add-FieldIfMissing {
             foreach ($key in $filteredParams.Keys) {
                 $params[$key] = $filteredParams[$key]
             }
-            Add-PnPField @params
+            # Out-Null: the returned Field object dumps ~40 lines (SchemaXml, JSLink, ...)
+            # per column -- thousands of lines on a full run, drowning the real messages.
+            Add-PnPField @params | Out-Null
             Write-Host "  Added column '$FieldName' ($FieldType) to '$ListName'." -ForegroundColor Green
         }
     }
@@ -238,13 +240,13 @@ function Add-FieldIfMissing {
     if ($postValues.Count -gt 0 -and $PSCmdlet.ShouldProcess("$ListName/$FieldName", "Ensure field properties")) {
         # Indexed must be set before EnforceUniqueValues
         if ($postValues.ContainsKey("Indexed") -and $postValues["Indexed"]) {
-            Set-PnPField -List $ListName -Identity $FieldName -Values @{ Indexed = $true }
+            Set-PnPField -List $ListName -Identity $FieldName -Values @{ Indexed = $true } | Out-Null
         }
         if ($postValues.ContainsKey("EnforceUniqueValues") -and $postValues["EnforceUniqueValues"]) {
-            Set-PnPField -List $ListName -Identity $FieldName -Values @{ EnforceUniqueValues = $true }
+            Set-PnPField -List $ListName -Identity $FieldName -Values @{ EnforceUniqueValues = $true } | Out-Null
         }
         if ($postValues.ContainsKey("DefaultValue")) {
-            Set-PnPField -List $ListName -Identity $FieldName -Values @{ DefaultValue = $postValues["DefaultValue"] }
+            Set-PnPField -List $ListName -Identity $FieldName -Values @{ DefaultValue = $postValues["DefaultValue"] } | Out-Null
         }
     }
 }
@@ -292,7 +294,7 @@ function New-MISList {
 
     if (-not $exists) {
         if ($PSCmdlet.ShouldProcess($InternalName, "Create list '$InternalName' ($Template)")) {
-            New-PnPList -Title $InternalName -Template $Template
+            New-PnPList -Title $InternalName -Template $Template | Out-Null
             Write-Host "Created list '$InternalName' ($Template)." -ForegroundColor Green
         }
     }
@@ -328,7 +330,7 @@ function Register-MISHubSite {
     catch {
         if ($PSCmdlet.ShouldProcess($Url, "Register as Hub site")) {
             try {
-                Register-PnPHubSite -Site $Url
+                Register-PnPHubSite -Site $Url | Out-Null
                 Write-Host "Registered site as Hub site." -ForegroundColor Green
             }
             catch {
@@ -346,8 +348,11 @@ function Register-MISHubSite {
 # Title = 'current' row. See docs/PROVISIONING-REFACTOR-PROPOSAL.md section 5.
 
 # Internal: fetch the MIS_SchemaVersion list item for a product scope (or $null).
+# Guarded by list existence, not $WhatIfPreference: under -WhatIf on a fresh site the
+# list was never created, and a read against a missing list throws under -EA Stop.
 function Get-MISSchemaItem {
     param([Parameter(Mandatory)][string]$Product)
+    if (-not (Test-ListExists -ListName "MIS_SchemaVersion")) { return $null }
     $q = "<View><Query><Where><Eq><FieldRef Name='Title'/><Value Type='Text'>$Product</Value></Eq></Where></Query></View>"
     return (Get-PnPListItem -List "MIS_SchemaVersion" -Query $q | Select-Object -First 1)
 }
@@ -493,8 +498,13 @@ function Add-MISConfigDefault {
         [string]$Description = "",
         [string]$JsonValue
     )
-    $q = "<View><Query><Where><And><Eq><FieldRef Name='Title'/><Value Type='Text'>$Key</Value></Eq><Eq><FieldRef Name='ProductScope'/><Value Type='Text'>$Product</Value></Eq></And></Where></Query></View>"
-    $existing = Get-PnPListItem -List "MIS_Config" -Query $q | Select-Object -First 1
+    # Existence guard, not $WhatIfPreference: -WhatIf on a fresh site never created
+    # MIS_Config, and the read would throw. A missing list simply means "no existing row".
+    $existing = $null
+    if (Test-ListExists -ListName "MIS_Config") {
+        $q = "<View><Query><Where><And><Eq><FieldRef Name='Title'/><Value Type='Text'>$Key</Value></Eq><Eq><FieldRef Name='ProductScope'/><Value Type='Text'>$Product</Value></Eq></And></Where></Query></View>"
+        $existing = Get-PnPListItem -List "MIS_Config" -Query $q | Select-Object -First 1
+    }
     if ($existing) {
         Write-Host "  Config '$Key' ($Product) already exists. Skipping." -ForegroundColor DarkGray
         return
@@ -508,14 +518,129 @@ function Add-MISConfigDefault {
 }
 
 # ============================================================================
-#  Shared master-data lists
+#  Graph per-list application grants (Lists.SelectedOperations.Selected model)
 # ============================================================================
-# The lists every product reads: MIS_Config + MIS_SchemaVersion + the master-data layer
-# (MIS_Customers, MIS_Suppliers base, MIS_Contacts, MIS_CatalogItems, MIS_InvoicingDetails).
-# Owned by Core; products NEVER create these -- they call Ensure-MISCoreLists (idempotent)
-# to guarantee their shared dependencies, then add only their own lists. Product-specific
-# columns on a master-data list are added by that product's script as idempotent EXTENSIONS
-# (e.g. InvoiceFlow adds Verified/VerifiedAt/RegistrySource/ApprovalOrder to MIS_Suppliers).
+
+# StrictMode-safe nested property read: permission rows for site groups/users carry
+# grantedToV2.siteGroup / .user, not .application -- touching .application there would
+# throw under StrictMode. (Same helper as grant-handoff-list-permissions.ps1.)
+function Get-MISPropSafe($obj, [string]$name) {
+    if ($null -eq $obj) { return $null }
+    $p = $obj.PSObject.Properties[$name]
+    if ($p) { return $p.Value }
+    return $null
+}
+
+function Get-MISPermAppId($perm) {
+    foreach ($field in 'grantedToV2', 'grantedTo') {
+        $id = Get-MISPropSafe (Get-MISPropSafe (Get-MISPropSafe $perm $field) 'application') 'id'
+        if ($id) { return $id }
+    }
+    $arr = Get-MISPropSafe $perm 'grantedToIdentitiesV2'
+    if ($arr) {
+        $id = Get-MISPropSafe (Get-MISPropSafe $arr[0] 'application') 'id'
+        if ($id) { return $id }
+    }
+    return $null
+}
+
+# Graph composite site id of the connected site, cached per run.
+function Get-MISGraphSiteId {
+    if (-not $script:MISGraphSiteId) {
+        $web = Get-PnPWeb -Includes Id
+        $hostName = ([Uri]$web.Url).Host
+        $script:MISGraphSiteId = "$hostName,$((Get-PnPSite -Includes Id).Id),$($web.Id)"
+    }
+    return $script:MISGraphSiteId
+}
+$script:MISGraphSiteId = $null
+
+<#
+.SYNOPSIS  Idempotently grants an application per-list access via the Graph beta
+           list-permissions API (POST sites/{site}/lists/{list}/permissions). A list the
+           app already holds (any role, incl. owner) is skipped. Returns $true when the
+           grant exists or was created, $false when it could not be -- the caller decides
+           how loud to be; this function only warns and never throws, because a missing
+           grant must not abort provisioning.
+
+           Works app-only (provisioning cert) and delegated alike. Delegated needs the
+           Microsoft Graph 'Sites.FullControl.All' DELEGATED permission on the connecting
+           app (documented least privilege is Sites.ReadWrite.All; we do not rely on it).
+           The roles array is serialized by hand: ConvertTo-Json collapses a single-element
+           array to a scalar, which the API rejects. grantedToV2 is tried first, then
+           grantedTo, for tenant-to-tenant variance.
+#>
+function Add-MISListAppPermissionIfMissing {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][string]$ListName,
+        [Parameter(Mandatory)][string]$AppId,
+        [Parameter(Mandatory)][string]$AppName,
+        [Parameter(Mandatory)][string[]]$Roles
+    )
+
+    if (-not (Test-ListExists -ListName $ListName)) {
+        if ($WhatIfPreference) {
+            Write-Host "  What if: grant '$AppName' [$($Roles -join ',')] on '$ListName' (list does not exist in a dry run)." -ForegroundColor DarkGray
+            return $true
+        }
+        Write-Warning "List '$ListName' not found -- cannot grant '$AppName'."
+        return $false
+    }
+
+    try {
+        $siteId = Get-MISGraphSiteId
+        $listId = (Get-PnPList -Identity $ListName).Id
+
+        $existing = Invoke-PnPGraphMethod -Url "beta/sites/$siteId/lists/$listId/permissions"
+        $values = Get-MISPropSafe $existing 'value'
+        foreach ($perm in @($values)) {
+            if ((Get-MISPermAppId $perm) -eq $AppId) {
+                Write-Host "  '$ListName': '$AppName' already granted. Skipping." -ForegroundColor DarkGray
+                return $true
+            }
+        }
+
+        if ($PSCmdlet.ShouldProcess($ListName, "Grant '$AppName' roles: $($Roles -join ',')")) {
+            $rolesJson = '["' + ($Roles -join '","') + '"]'
+            $granted = $false
+            foreach ($field in 'grantedToV2', 'grantedTo') {
+                $body = "{`"roles`":$rolesJson,`"$field`":{`"application`":{`"id`":`"$AppId`",`"displayName`":`"$AppName`"}}}"
+                try {
+                    Invoke-PnPGraphMethod -Method Post -Url "beta/sites/$siteId/lists/$listId/permissions" `
+                        -Content $body -ContentType "application/json" | Out-Null
+                    $granted = $true
+                    break
+                }
+                catch {
+                    if ($field -eq 'grantedTo') { throw }
+                }
+            }
+            if ($granted) {
+                Write-Host "  '$ListName': granted '$AppName' [$($Roles -join ',')]." -ForegroundColor Green
+            }
+        }
+        return $true
+    }
+    catch {
+        Write-Warning "Could not grant '$AppName' on '$ListName': $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# ============================================================================
+#  Shared core + master-data lists
+# ============================================================================
+# Two layers, owned by Core; products NEVER create these lists themselves:
+#   - Ensure-MISCoreLists   : MIS_Config + MIS_SchemaVersion + legacy conversion + Core
+#                             stamp. EVERY product calls this.
+#   - Ensure-MISMasterData  : the master-data layer (MIS_Customers, MIS_Suppliers base,
+#                             MIS_Contacts, MIS_CatalogItems, MIS_InvoicingDetails,
+#                             MIS_Locations, MIS_Departments) + product-neutral config
+#                             defaults. Called ONLY by products that read master data.
+# Product-specific columns on a master-data list are added by that product's script as
+# idempotent EXTENSIONS (e.g. InvoiceFlow adds Verified/VerifiedAt/RegistrySource/
+# ApprovalOrder to MIS_Suppliers).
 
 # Core schema baseline. Bump when the shared master-data shape changes.
 # 2.1.0 (2026-08-11): LegalForm added to the shared address/company columns.
@@ -557,8 +682,9 @@ $script:MISAddressColumns = {
 
 <#
 .SYNOPSIS  Ensures the shared scaffolding exists: MIS_Config, MIS_SchemaVersion, the legacy
-           schema conversion, the master-data lists, and the Core schema stamp. Idempotent.
-           Every product script calls this before creating its own lists.
+           schema conversion, and the Core schema stamp. Idempotent. Every product script
+           calls this before creating its own lists. Master data is NOT created here --
+           products that need it call Ensure-MISMasterData as well.
 #>
 function Ensure-MISCoreLists {
     # MIS_Config (shared key/value config, partitioned by ProductScope)
@@ -584,6 +710,23 @@ function Ensure-MISCoreLists {
     # Runs after MIS_SchemaVersion exists so it always has a list to read/write.
     Convert-MISLegacySchema
 
+    # Record the Core schema baseline (raise-only). Stamped here -- it versions the core
+    # provisioning contract, not the master-data content -- so every product, including
+    # ones that never provision master data, gets a Core row.
+    Set-MISSchema -Product "Core" -Version $script:MISCoreSchemaVersion
+}
+
+<#
+.SYNOPSIS  Ensures the shared MASTER-DATA layer: MIS_Customers, MIS_Suppliers (base),
+           MIS_Contacts, MIS_CatalogItems, MIS_InvoicingDetails, MIS_Locations,
+           MIS_Departments, plus the product-neutral config defaults. Idempotent.
+           Called ONLY by products that read master data (InvoiceFlow, InvoiceOut,
+           Reserve) and by provision-core.ps1. Handoff, Alerts and Enroll deliberately
+           do not call this: a file-handoff customer must not find an invoicing data
+           model (ICO/DIC/IBAN/UnitPrice columns) in their tenant. Existing DataCenters
+           that already have these lists are untouched either way.
+#>
+function Ensure-MISMasterData {
     # Master-data layer
     Write-Host "`n--- MIS_Customers ---" -ForegroundColor Yellow
     New-MISList -InternalName "MIS_Customers" -ColumnsBlock $script:MISAddressColumns
@@ -658,23 +801,28 @@ function Ensure-MISCoreLists {
         Add-FieldIfMissing -ListName $list -FieldName "IsActive"    -FieldType "Boolean" -ExtraParams @{ DefaultValue = "1" }
     }
 
-    # Global (product-neutral) default config.
+    # Global (product-neutral) default config. Lives with the master data: these keys
+    # (VAT, currency) only mean something to the invoicing-family products.
     Write-Host "`n--- Global MIS_Config defaults ---" -ForegroundColor Yellow
     Add-MISConfigDefault -Product "global" -Key "DefaultVATRate"  -Value "21"    -Description "Default VAT rate (%)"
     Add-MISConfigDefault -Product "global" -Key "DefaultCurrency" -Value "CZK"   -Description "Default currency code (ISO 4217)"
     Add-MISConfigDefault -Product "global" -Key "DefaultLocale"   -Value "cs-CZ" -Description "Default locale for formatting"
     Add-MISConfigDefault -Product "global" -Key "DefaultCountry"  -Value "CZ"    -Description "Default country code (ISO 3166-1 alpha-2)"
-
-    # Record the Core schema baseline (raise-only). Stamped here so a Handoff-only site --
-    # which never runs provision-core.ps1 -- still gets a Core row.
-    Set-MISSchema -Product "Core" -Version $script:MISCoreSchemaVersion
 }
 # <<< INLINE-CORE <<<
 
 # Handoff product schema version (per-product; independent of the Core baseline).
 # 1.4.6: LinkContext on MIS_HandoffActivity (server >= 1.7.0 stores the pre-sign token
 #        payload there so links can be reissued/extended; context only, never the token).
-$HandoffSchemaVersion = "1.4.6"
+# 1.4.7: no list-shape change -- provisioning contract only: the script now grants the
+#        runtime service its four DataCenter lists itself, no longer creates the shared
+#        master-data lists, and no longer registers the site as a Hub.
+# 1.4.8: "Partner can close the link" per share -- Choice Yes/No (NO default) columns
+#        PartnerCanClose on MIS_HandoffActivity (resolved value per share, written by the
+#        server at creation) and SharePartnerCanClose on MIS_HandoffEnabledLibraries (library
+#        default). Empty = not set -> the server resolves the tenant setting live (today's
+#        behaviour), so a tenant that is never backfilled behaves exactly as before.
+$HandoffSchemaVersion = "1.4.8"
 
 # ---- Connect + shared core -------------------------------------------------
 
@@ -685,10 +833,11 @@ Write-Host "Site: $SiteUrl`n"
 # evaluate the rest of the run instead of failing with "no connection".
 Connect-MISDataCenter -Url $SiteUrl
 
-# Shared core (Hub + master-data + schema). Skipped when provision-all.ps1 already ran it.
+# Shared core. Skipped when provision-all.ps1 already ran it. No Hub registration:
+# nothing in the suite consumes the hub, and on a customer-run (non-SP-admin) session
+# it only produced a scary warning (see MIS-DataCenter TODO, hub dead-code decision).
 if (-not $SkipCore) {
-    Register-MISHubSite -Url $SiteUrl
-    # Ensures Hub, MIS_Config, MIS_SchemaVersion, master-data lists, legacy schema conversion,
+    # Ensures MIS_Config, MIS_SchemaVersion, master-data lists, legacy schema conversion,
     # and the Core schema stamp. Idempotent.
     Ensure-MISCoreLists
 }
@@ -737,6 +886,11 @@ New-MISList -InternalName "MIS_HandoffActivity" -ColumnsBlock {
     # link can be reissued (copy/resend/extend). Context only -- the signed token is never
     # stored and the payload is worthless without the tenant's jwtSecret.
     Add-FieldIfMissing -ListName $list -FieldName "LinkContext"   -FieldType "Note"
+    # Schema 1.4.8: may the partner close this share ("I'm done")? Choice, deliberately NO
+    # default -- empty must stay distinguishable from "No" (empty = tenant setting, live).
+    # DefaultValue "" is explicit: Add-PnPField gives a Choice column the first choice ("Yes") as
+    # default, which SharePoint would stamp on every new row. Re-runs clear it on existing fields.
+    Add-FieldIfMissing -ListName $list -FieldName "PartnerCanClose" -FieldType "Choice" -ExtraParams @{ Choices = @("Yes","No"); DefaultValue = "" }
 }
 
 # ---- MIS_HandoffEnabledLibraries -------------------------------------------
@@ -761,20 +915,33 @@ New-MISList -InternalName "MIS_HandoffEnabledLibraries" -ColumnsBlock {
     Add-FieldIfMissing -ListName $list -FieldName "DisabledAt"  -FieldType "DateTime"
     Add-FieldIfMissing -ListName $list -FieldName "RequestedBy" -FieldType "Text"
     Add-FieldIfMissing -ListName $list -FieldName "RequestedAt" -FieldType "DateTime"
+    # Schema 1.4.8: library default for "Partner can close the link" on new shares.
+    # Choice, NO default -- empty = inherit the tenant setting.
+    Add-FieldIfMissing -ListName $list -FieldName "SharePartnerCanClose" -FieldType "Choice" -ExtraParams @{ Choices = @("Yes","No"); DefaultValue = "" }
 }
 
 # Existing tenants: Add-FieldIfMissing does NOT update an existing Choice field's choices,
 # so ensure 'Requested' is present on a field created before schema 1.4.5 (idempotent).
-try {
-    $statusField = Get-PnPField -List "MIS_HandoffEnabledLibraries" -Identity "Status" -ErrorAction Stop
-    if ($statusField.Choices -notcontains "Requested") {
-        Set-PnPField -List "MIS_HandoffEnabledLibraries" -Identity "Status" `
-            -Values @{ Choices = @("Enabled", "Disabled", "Requested") } | Out-Null
-        Write-Host "Status choices updated to include 'Requested'." -ForegroundColor Green
+# List-existence guard keeps -WhatIf on a fresh site clean (the list was never created).
+if (Test-ListExists -ListName "MIS_HandoffEnabledLibraries") {
+    try {
+        $statusField = Get-PnPField -List "MIS_HandoffEnabledLibraries" -Identity "Status" -ErrorAction Stop
+        if ($statusField.Choices -notcontains "Requested" -and
+            $PSCmdlet.ShouldProcess("MIS_HandoffEnabledLibraries/Status", "Add choice 'Requested'")) {
+            # [string[]]: PnP 3.x rejects an Object[] for Choices (warns and ignores the value).
+            Set-PnPField -List "MIS_HandoffEnabledLibraries" -Identity "Status" `
+                -Values @{ Choices = [string[]]@("Enabled", "Disabled", "Requested") } | Out-Null
+            $check = Get-PnPField -List "MIS_HandoffEnabledLibraries" -Identity "Status" -ErrorAction Stop
+            if ($check.Choices -contains "Requested") {
+                Write-Host "Status choices updated to include 'Requested'." -ForegroundColor Green
+            } else {
+                Write-Warning "Status choices still lack 'Requested' -- add it by hand in the list settings."
+            }
+        }
     }
-}
-catch {
-    Write-Warning "Could not verify/update Status choices: $($_.Exception.Message)"
+    catch {
+        Write-Warning "Could not verify/update Status choices: $($_.Exception.Message)"
+    }
 }
 
 # ---- Handoff365 config seeding (optional) ----------------------------------
@@ -804,7 +971,12 @@ if (-not $SkipConfig) {
     )
 
     foreach ($entry in $handoffConfig) {
-        $existing = Get-PnPListItem -List "MIS_Config" -Query "<View><Query><Where><And><Eq><FieldRef Name='Title'/><Value Type='Text'>$($entry.Key)</Value></Eq><Eq><FieldRef Name='ProductScope'/><Value Type='Text'>Handoff365</Value></Eq></And></Where></Query></View>"
+        # Existence guard, not $WhatIfPreference: -WhatIf on a fresh site never created
+        # MIS_Config, and the read would throw under -EA Stop.
+        $existing = $null
+        if (Test-ListExists -ListName "MIS_Config") {
+            $existing = Get-PnPListItem -List "MIS_Config" -Query "<View><Query><Where><And><Eq><FieldRef Name='Title'/><Value Type='Text'>$($entry.Key)</Value></Eq><Eq><FieldRef Name='ProductScope'/><Value Type='Text'>Handoff365</Value></Eq></And></Where></Query></View>"
+        }
         if ($existing) {
             Write-Host "  Config '$($entry.Key)' (Handoff365) already exists. Skipping." -ForegroundColor DarkGray
             continue
@@ -819,6 +991,40 @@ if (-not $SkipConfig) {
             Write-Host "  Created config '$($entry.Key)' = '$($entry.Value)' (Handoff365)." -ForegroundColor Green
         }
     }
+}
+
+# ---- Runtime service list grants ---------------------------------------------
+# The Handoff 365 service holds Lists.SelectedOperations.Selected: consent alone grants
+# nothing, each list must be granted. Read on MIS_Config, write on the three Handoff
+# lists -- the same grants the assisted path makes via grant-handoff-list-permissions.ps1
+# (which remains for re-grants). Self-service: works under the customer's own delegated
+# app when it carries Microsoft Graph 'Sites.FullControl.All' (delegated). A failed grant
+# must NOT abort the run -- the lists and config are already in place, and support can
+# grant remotely afterwards.
+
+$HandoffRuntimeAppId   = "58e7d956-12e2-491c-b0dc-69086277aaa0"
+$HandoffRuntimeAppName = "Malach IS Handoff 365"
+
+Write-Host "`n--- Handoff 365 service list grants ---" -ForegroundColor Yellow
+$grantFailures = @()
+foreach ($grant in @(
+    @{ L = "MIS_Config";                  R = @("read")  }
+    @{ L = "MIS_HandoffAuditLog";         R = @("write") }
+    @{ L = "MIS_HandoffActivity";         R = @("write") }
+    @{ L = "MIS_HandoffEnabledLibraries"; R = @("write") }
+)) {
+    if (-not (Add-MISListAppPermissionIfMissing -ListName $grant.L `
+            -AppId $HandoffRuntimeAppId -AppName $HandoffRuntimeAppName -Roles $grant.R)) {
+        $grantFailures += $grant.L
+    }
+}
+if ($grantFailures.Count) {
+    Write-Warning (("The Handoff 365 service could not be granted access to: {0}. " +
+        "Creating a handoff will fail with 'Unauthorized' until this is fixed. " +
+        "If you ran this script yourself, your app registration is most likely missing the " +
+        "Microsoft Graph 'Sites.FullControl.All' DELEGATED permission -- add it, grant admin " +
+        "consent, and re-run this script (safe to repeat), or email support@malachis.eu and " +
+        "we grant it remotely.") -f ($grantFailures -join ", "))
 }
 
 # ---- Stamp Handoff365 schema -----------------------------------------------
